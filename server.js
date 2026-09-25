@@ -171,7 +171,7 @@ setInterval(() => {
 // 1. ADMIN / BROADCASTER NAMESPACE (/admin)
 // ==========================================
 adminNs.on('connection', (socket) => {
-  console.log(`[Admin Socket] Broadcaster connected: ${socket.id}`);
+  console.log(`[Server] Broadcaster connected to /admin: ${socket.id}`);
 
   // Send current state and chat history on connect
   socket.emit('stream:init', {
@@ -206,11 +206,12 @@ adminNs.on('connection', (socket) => {
     io.to(streamState.id).emit('stream:status-changed', statusPayload);
     adminNs.emit('stream:status-changed', statusPayload);
 
+    // Notify all currently connected viewers that broadcaster is live and ready
     io.to(streamState.id).emit('broadcaster:ready', {
       streamerSocketId: socket.id,
     });
 
-    console.log(`[Stream] Live broadcast started: "${streamState.title}" by Admin (${socket.id})`);
+    console.log(`[Server] Live broadcast started: "${streamState.title}" by Admin (${socket.id})`);
   });
 
   // Stop Broadcast
@@ -230,7 +231,7 @@ adminNs.on('connection', (socket) => {
     io.to(streamState.id).emit('stream:stopped');
     adminNs.emit('stream:stopped');
 
-    console.log(`[Stream] Broadcast stopped by Admin (${socket.id})`);
+    console.log(`[Server] Broadcast stopped by Admin (${socket.id})`);
   });
 
   // Update Stream Metadata
@@ -249,22 +250,25 @@ adminNs.on('connection', (socket) => {
     adminNs.emit('stream:info-updated', updatePayload);
   });
 
-  // WebRTC Offer from Broadcaster to Viewer
+  // WebRTC Offer from Broadcaster to a specific Viewer
   socket.on('webrtc:offer', (data) => {
     if (data?.targetSocketId && data?.offer) {
+      console.log(`[Server] Offer routed from broadcaster (${socket.id}) to viewer: ${data.targetSocketId} (attempt: ${data.attemptId || 'default'})`);
       io.to(data.targetSocketId).emit('webrtc:offer', {
         offer: data.offer,
         fromSocketId: socket.id,
+        attemptId: data.attemptId,
       });
     }
   });
 
-  // WebRTC ICE Candidate from Broadcaster to Viewer
+  // WebRTC ICE Candidate from Broadcaster to a specific Viewer
   socket.on('webrtc:ice-candidate', (data) => {
     if (data?.targetSocketId && data?.candidate) {
       io.to(data.targetSocketId).emit('webrtc:ice-candidate', {
         candidate: data.candidate,
         fromSocketId: socket.id,
+        attemptId: data.attemptId,
       });
     }
   });
@@ -348,7 +352,7 @@ adminNs.on('connection', (socket) => {
   });
 
   socket.on('disconnect', () => {
-    console.log(`[Admin Socket] Broadcaster disconnected: ${socket.id}`);
+    console.log(`[Server] Broadcaster socket disconnected: ${socket.id}`);
     if (socket.id === streamState.streamerSocketId) {
       streamState.status = 'offline';
       streamState.streamerSocketId = null;
@@ -386,6 +390,8 @@ io.on('connection', (socket) => {
     });
     viewersPresence.set(streamId, streamViewers);
 
+    console.log(`[Server] Viewer connected: ${socket.id} (user: ${username}, streamStatus: ${streamState.status})`);
+
     socket.emit('stream:init', {
       stream: streamState,
       messages: chatMessages.slice(-50),
@@ -393,9 +399,54 @@ io.on('connection', (socket) => {
 
     broadcastViewerStats(io, adminNs, streamId);
 
+    // If stream is currently LIVE, immediately prompt the broadcaster to generate a fresh offer for this viewer
     if (streamState.status === 'live' && streamState.streamerSocketId) {
+      console.log(`[Server] Stream currently LIVE. Requesting broadcaster offer for viewer: ${socket.id}`);
+      adminNs.emit('webrtc:new-viewer', {
+        viewerSocketId: socket.id,
+        viewerId: viewerId,
+        attemptId: data?.attemptId,
+      });
+
       socket.emit('broadcaster:ready', {
         streamerSocketId: streamState.streamerSocketId,
+      });
+    }
+  });
+
+  // Viewer Explicit WebRTC Offer Request
+  socket.on('webrtc:viewer-ready', (data) => {
+    console.log(`[Server] Viewer requested fresh WebRTC offer: ${socket.id} (attemptId: ${data?.attemptId || 'default'})`);
+    if (streamState.status === 'live' && streamState.streamerSocketId) {
+      adminNs.emit('webrtc:new-viewer', {
+        viewerSocketId: socket.id,
+        viewerId: data?.viewerId || socket.data?.viewerId,
+        attemptId: data?.attemptId,
+      });
+    } else {
+      console.log(`[Server] Viewer ${socket.id} requested offer, but stream is currently ${streamState.status}`);
+    }
+  });
+
+  // Viewer Answer routed to Broadcaster
+  socket.on('webrtc:answer', (data) => {
+    if (data?.answer) {
+      console.log(`[Server] Answer routed from viewer (${socket.id}) to broadcaster (attempt: ${data.attemptId || 'default'})`);
+      adminNs.emit('webrtc:answer', {
+        answer: data.answer,
+        fromSocketId: socket.id,
+        attemptId: data.attemptId,
+      });
+    }
+  });
+
+  // Viewer ICE Candidate routed to Broadcaster
+  socket.on('webrtc:ice-candidate', (data) => {
+    if (data?.candidate) {
+      adminNs.emit('webrtc:ice-candidate', {
+        candidate: data.candidate,
+        fromSocketId: socket.id,
+        attemptId: data.attemptId,
       });
     }
   });
@@ -419,34 +470,6 @@ io.on('connection', (socket) => {
     if (streamViewers && viewerId) {
       streamViewers.delete(viewerId);
       broadcastViewerStats(io, adminNs, streamId);
-    }
-  });
-
-  // WebRTC Signaling: Viewer Ready
-  socket.on('webrtc:viewer-ready', (data) => {
-    adminNs.emit('webrtc:new-viewer', {
-      viewerSocketId: socket.id,
-      viewerId: data?.viewerId || socket.data?.viewerId,
-    });
-  });
-
-  // WebRTC Signaling: Viewer Answer
-  socket.on('webrtc:answer', (data) => {
-    if (data?.answer) {
-      adminNs.emit('webrtc:answer', {
-        answer: data.answer,
-        fromSocketId: socket.id,
-      });
-    }
-  });
-
-  // WebRTC Signaling: Viewer ICE Candidate
-  socket.on('webrtc:ice-candidate', (data) => {
-    if (data?.candidate) {
-      adminNs.emit('webrtc:ice-candidate', {
-        candidate: data.candidate,
-        fromSocketId: socket.id,
-      });
     }
   });
 
@@ -502,6 +525,7 @@ io.on('connection', (socket) => {
   // Disconnect
   socket.on('disconnect', () => {
     rateLimitMap.delete(socket.id);
+    console.log(`[Server] Viewer disconnected: ${socket.id}`);
 
     if (socket.data?.viewerId) {
       const streamViewers = viewersPresence.get(socket.data.streamId || streamState.id);
