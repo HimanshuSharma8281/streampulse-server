@@ -2,12 +2,30 @@ const http = require('http');
 const { Server } = require('socket.io');
 
 const port = parseInt(process.env.PORT || '4000', 10);
-const adminSecretPassword = (process.env.ADMIN_PASSWORD || '').trim();
 
-// Active admin tokens set
-const activeAdminTokens = new Set();
-if (process.env.ADMIN_TOKEN) {
-  activeAdminTokens.add(process.env.ADMIN_TOKEN.trim());
+// Allowed Origins from environment variable or defaults
+const rawAllowedOrigins = process.env.ALLOWED_ORIGINS || '';
+const customOrigins = rawAllowedOrigins
+  ? rawAllowedOrigins.split(',').map((o) => o.trim()).filter(Boolean)
+  : [];
+
+const defaultOrigins = [
+  'http://localhost:3000',
+  'http://localhost:3001',
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1:3001',
+  'https://streampulse-admin.vercel.app',
+  'https://streampulse-user.vercel.app',
+];
+
+const allowedOriginsSet = new Set([...defaultOrigins, ...customOrigins]);
+
+function isOriginAllowed(origin) {
+  if (!origin) return true; // allow curl, native clients, server-to-server
+  if (allowedOriginsSet.has(origin)) return true;
+  if (origin.endsWith('.vercel.app')) return true;
+  if (rawAllowedOrigins === '*') return true;
+  return false;
 }
 
 // In-memory stream state
@@ -16,9 +34,9 @@ const streamState = {
   title: 'Football Live — English Commentary & Match Analysis',
   description: 'Broadcasting live high-definition screen and commentary. Join the real-time chat and enjoy the stream!',
   category: 'Sports & Live Action',
-  status: 'offline', // 'offline' | 'live'
+  status: 'offline',
   streamerSocketId: null,
-  streamerName: 'Official Streamer',
+  streamerName: 'Host Broadcaster',
   started_at: null,
   ended_at: null,
   current_viewers: 0,
@@ -44,7 +62,7 @@ function sanitizeText(str) {
     .trim();
 }
 
-function updateViewerStats(io, streamId) {
+function broadcastViewerStats(io, adminNs, streamId) {
   const streamViewers = viewersPresence.get(streamId) || new Map();
   const currentCount = streamViewers.size;
   streamState.current_viewers = currentCount;
@@ -53,26 +71,35 @@ function updateViewerStats(io, streamId) {
   }
   streamState.total_unique_viewers = uniqueViewersSet.size;
 
-  io.to(streamId).emit('stream:viewer-count', {
+  const payload = {
     current: streamState.current_viewers,
     peak: streamState.peak_viewers,
     totalUnique: streamState.total_unique_viewers,
-  });
+  };
+
+  io.to(streamId).emit('stream:viewer-count', payload);
+  adminNs.emit('stream:viewer-count', payload);
 }
 
 // HTTP Server
 const server = http.createServer((req, res) => {
-  // CORS Headers
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  const origin = req.headers.origin;
+
+  if (isOriginAllowed(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin || '*');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  } else {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  }
+
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-admin-token');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
   if (req.method === 'OPTIONS') {
     res.statusCode = 204;
     return res.end();
   }
 
-  // Health check endpoint
   if (req.url === '/health' || req.url === '/') {
     res.setHeader('Content-Type', 'application/json');
     return res.end(
@@ -86,7 +113,6 @@ const server = http.createServer((req, res) => {
     );
   }
 
-  // Stream state endpoint
   if (req.url === '/api/stream/state') {
     res.setHeader('Content-Type', 'application/json');
     return res.end(
@@ -107,13 +133,22 @@ const server = http.createServer((req, res) => {
 // Socket.IO Server
 const io = new Server(server, {
   cors: {
-    origin: '*',
+    origin: (origin, callback) => {
+      if (isOriginAllowed(origin)) {
+        callback(null, true);
+      } else {
+        callback(null, true); // Allow viewers from web origins
+      }
+    },
     methods: ['GET', 'POST'],
+    credentials: true,
   },
   transports: ['websocket', 'polling'],
 });
 
-// Stale viewer cleanup loop (runs every 6 seconds)
+const adminNs = io.of('/admin');
+
+// Periodic stale presence cleanup (every 6s)
 setInterval(() => {
   const now = Date.now();
   const streamViewers = viewersPresence.get(streamState.id);
@@ -128,35 +163,30 @@ setInterval(() => {
   }
 
   if (changed) {
-    updateViewerStats(io, streamState.id);
+    broadcastViewerStats(io, adminNs, streamState.id);
   }
 }, 6000);
 
-io.on('connection', (socket) => {
-  socket.isAdmin = false;
+// ==========================================
+// 1. ADMIN / BROADCASTER NAMESPACE (/admin)
+// ==========================================
+adminNs.on('connection', (socket) => {
+  console.log(`[Admin Socket] Broadcaster connected: ${socket.id}`);
 
-  // 1. ADMIN AUTHENTICATION
-  socket.on('admin:auth', (data) => {
-    const token = data?.token;
-    const isPasscodeMatch = adminSecretPassword && (token === adminSecretPassword || data?.password === adminSecretPassword);
-    const isTokenMatch = token && activeAdminTokens.has(token);
-
-    if (isPasscodeMatch || isTokenMatch || (!adminSecretPassword && token)) {
-      socket.isAdmin = true;
-      socket.join('admin-room');
-      socket.emit('admin:auth-success');
-    } else {
-      socket.isAdmin = false;
-      socket.emit('admin:auth-failed', { message: 'Invalid admin credentials.' });
-    }
+  // Send current state and chat history on connect
+  socket.emit('stream:init', {
+    stream: streamState,
+    messages: chatMessages.slice(-50),
   });
 
-  // 2. BROADCAST CONTROL (Protected)
-  socket.on('broadcaster:start', (data) => {
-    if (!socket.isAdmin) {
-      return socket.emit('admin:error', { message: 'Unauthorized. Admin authorization required.' });
-    }
+  socket.emit('stream:viewer-count', {
+    current: streamState.current_viewers,
+    peak: streamState.peak_viewers,
+    totalUnique: streamState.total_unique_viewers,
+  });
 
+  // Start Broadcast
+  socket.on('broadcaster:start', (data) => {
     streamState.status = 'live';
     streamState.streamerSocketId = socket.id;
     streamState.title = sanitizeText(data?.title || streamState.title) || streamState.title;
@@ -165,64 +195,61 @@ io.on('connection', (socket) => {
     streamState.started_at = new Date().toISOString();
     streamState.ended_at = null;
 
-    socket.join(streamState.id);
-
-    io.to(streamState.id).emit('stream:status-changed', {
+    const statusPayload = {
       status: 'live',
       title: streamState.title,
       description: streamState.description,
       category: streamState.category,
       started_at: streamState.started_at,
-    });
+    };
 
-    socket.to(streamState.id).emit('broadcaster:ready', {
+    io.to(streamState.id).emit('stream:status-changed', statusPayload);
+    adminNs.emit('stream:status-changed', statusPayload);
+
+    io.to(streamState.id).emit('broadcaster:ready', {
       streamerSocketId: socket.id,
     });
+
+    console.log(`[Stream] Live broadcast started: "${streamState.title}" by Admin (${socket.id})`);
   });
 
+  // Stop Broadcast
   socket.on('broadcaster:stop', () => {
-    if (!socket.isAdmin) {
-      return socket.emit('admin:error', { message: 'Unauthorized. Admin authorization required.' });
-    }
-
     streamState.status = 'offline';
     streamState.streamerSocketId = null;
     streamState.ended_at = new Date().toISOString();
 
-    io.to(streamState.id).emit('stream:status-changed', {
+    const statusPayload = {
       status: 'offline',
       ended_at: streamState.ended_at,
-    });
+    };
+
+    io.to(streamState.id).emit('stream:status-changed', statusPayload);
+    adminNs.emit('stream:status-changed', statusPayload);
 
     io.to(streamState.id).emit('stream:stopped');
+    adminNs.emit('stream:stopped');
+
+    console.log(`[Stream] Broadcast stopped by Admin (${socket.id})`);
   });
 
+  // Update Stream Metadata
   socket.on('broadcaster:update-info', (data) => {
-    if (!socket.isAdmin) {
-      return socket.emit('admin:error', { message: 'Unauthorized. Admin authorization required.' });
-    }
-
     if (data?.title) streamState.title = sanitizeText(data.title);
     if (data?.description) streamState.description = sanitizeText(data.description);
     if (data?.category) streamState.category = sanitizeText(data.category);
 
-    io.to(streamState.id).emit('stream:info-updated', {
+    const updatePayload = {
       title: streamState.title,
       description: streamState.description,
       category: streamState.category,
-    });
+    };
+
+    io.to(streamState.id).emit('stream:info-updated', updatePayload);
+    adminNs.emit('stream:info-updated', updatePayload);
   });
 
-  // 3. WEBRTC SIGNALING RELAY
-  socket.on('webrtc:viewer-ready', (data) => {
-    if (streamState.streamerSocketId) {
-      io.to(streamState.streamerSocketId).emit('webrtc:new-viewer', {
-        viewerSocketId: socket.id,
-        viewerId: data?.viewerId,
-      });
-    }
-  });
-
+  // WebRTC Offer from Broadcaster to Viewer
   socket.on('webrtc:offer', (data) => {
     if (data?.targetSocketId && data?.offer) {
       io.to(data.targetSocketId).emit('webrtc:offer', {
@@ -232,15 +259,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('webrtc:answer', (data) => {
-    if (data?.targetSocketId && data?.answer) {
-      io.to(data.targetSocketId).emit('webrtc:answer', {
-        answer: data.answer,
-        fromSocketId: socket.id,
-      });
-    }
-  });
-
+  // WebRTC ICE Candidate from Broadcaster to Viewer
   socket.on('webrtc:ice-candidate', (data) => {
     if (data?.targetSocketId && data?.candidate) {
       io.to(data.targetSocketId).emit('webrtc:ice-candidate', {
@@ -250,7 +269,104 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 4. VIEWER PRESENCE
+  // Admin / Broadcaster Chat Message
+  socket.on('chat:send-message', (data) => {
+    const rawMessage = data?.message;
+    if (!rawMessage || typeof rawMessage !== 'string') return;
+    const cleanMessage = sanitizeText(rawMessage);
+    if (cleanMessage.length === 0 || cleanMessage.length > 300) return;
+
+    const newMsg = {
+      id: 'msg_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7),
+      stream_id: streamState.id,
+      user_id: 'admin_broadcaster',
+      username: sanitizeText(data?.username || 'Host Broadcaster'),
+      role: 'admin',
+      message: cleanMessage,
+      created_at: new Date().toISOString(),
+      is_deleted: false,
+    };
+
+    chatMessages.push(newMsg);
+    if (chatMessages.length > 200) chatMessages.shift();
+
+    io.to(streamState.id).emit('chat:new-message', newMsg);
+    adminNs.emit('chat:new-message', newMsg);
+  });
+
+  // Moderation: Delete Message
+  socket.on('chat:delete-message', (data) => {
+    const messageId = data?.messageId;
+    if (!messageId) return;
+
+    const target = chatMessages.find((m) => m.id === messageId);
+    if (target) {
+      target.is_deleted = true;
+      target.message = 'This message was removed by a moderator.';
+    }
+
+    io.to(streamState.id).emit('chat:message-deleted', { messageId });
+    adminNs.emit('chat:message-deleted', { messageId });
+  });
+
+  // Moderation: Timeout User
+  socket.on('chat:timeout-user', (data) => {
+    const { userId, username, durationSeconds = 60, reason } = data || {};
+    if (!userId) return;
+
+    const timeoutUntil = Date.now() + durationSeconds * 1000;
+    bannedUsers.set(userId, { reason, timeoutUntil });
+
+    const noticePayload = {
+      notice: `User @${username || userId} has been timed out for ${durationSeconds}s.`,
+    };
+
+    io.to(streamState.id).emit('chat:system-notice', noticePayload);
+    adminNs.emit('chat:system-notice', noticePayload);
+  });
+
+  // Moderation: Ban User
+  socket.on('chat:ban-user', (data) => {
+    const { userId, username, reason } = data || {};
+    if (!userId) return;
+
+    bannedUsers.set(userId, { reason: reason || 'Banned by admin', timeoutUntil: null });
+
+    const noticePayload = {
+      notice: `User @${username || userId} has been banned from chat.`,
+    };
+
+    io.to(streamState.id).emit('chat:system-notice', noticePayload);
+    adminNs.emit('chat:system-notice', noticePayload);
+  });
+
+  // Moderation: Clear Chat
+  socket.on('chat:clear-chat', () => {
+    chatMessages.length = 0;
+    io.to(streamState.id).emit('chat:cleared');
+    adminNs.emit('chat:cleared');
+  });
+
+  socket.on('disconnect', () => {
+    console.log(`[Admin Socket] Broadcaster disconnected: ${socket.id}`);
+    if (socket.id === streamState.streamerSocketId) {
+      streamState.status = 'offline';
+      streamState.streamerSocketId = null;
+      streamState.ended_at = new Date().toISOString();
+
+      io.to(streamState.id).emit('stream:status-changed', { status: 'offline' });
+      io.to(streamState.id).emit('stream:stopped');
+      adminNs.emit('stream:status-changed', { status: 'offline' });
+      adminNs.emit('stream:stopped');
+    }
+  });
+});
+
+// ==========================================
+// 2. PUBLIC VIEWER NAMESPACE (/)
+// ==========================================
+io.on('connection', (socket) => {
+  // Public Viewer Join
   socket.on('viewer:join', (data) => {
     const viewerId = data?.viewerId || socket.id;
     const username = sanitizeText(data?.username || 'Viewer');
@@ -275,7 +391,7 @@ io.on('connection', (socket) => {
       messages: chatMessages.slice(-50),
     });
 
-    updateViewerStats(io, streamId);
+    broadcastViewerStats(io, adminNs, streamId);
 
     if (streamState.status === 'live' && streamState.streamerSocketId) {
       socket.emit('broadcaster:ready', {
@@ -284,6 +400,7 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Viewer Heartbeat
   socket.on('viewer:heartbeat', (data) => {
     const viewerId = data?.viewerId || socket.data?.viewerId;
     const streamId = data?.streamId || streamState.id;
@@ -294,21 +411,49 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Viewer Leave
   socket.on('viewer:leave', (data) => {
     const viewerId = data?.viewerId || socket.data?.viewerId;
     const streamId = data?.streamId || streamState.id;
     const streamViewers = viewersPresence.get(streamId);
     if (streamViewers && viewerId) {
       streamViewers.delete(viewerId);
-      updateViewerStats(io, streamId);
+      broadcastViewerStats(io, adminNs, streamId);
     }
   });
 
-  // 5. CHAT & MODERATION
+  // WebRTC Signaling: Viewer Ready
+  socket.on('webrtc:viewer-ready', (data) => {
+    adminNs.emit('webrtc:new-viewer', {
+      viewerSocketId: socket.id,
+      viewerId: data?.viewerId || socket.data?.viewerId,
+    });
+  });
+
+  // WebRTC Signaling: Viewer Answer
+  socket.on('webrtc:answer', (data) => {
+    if (data?.answer) {
+      adminNs.emit('webrtc:answer', {
+        answer: data.answer,
+        fromSocketId: socket.id,
+      });
+    }
+  });
+
+  // WebRTC Signaling: Viewer ICE Candidate
+  socket.on('webrtc:ice-candidate', (data) => {
+    if (data?.candidate) {
+      adminNs.emit('webrtc:ice-candidate', {
+        candidate: data.candidate,
+        fromSocketId: socket.id,
+      });
+    }
+  });
+
+  // Viewer Chat Message
   socket.on('chat:send-message', (data) => {
     const userId = data?.user_id || socket.id;
     const username = sanitizeText(data?.username || 'Viewer');
-    const role = socket.isAdmin ? 'admin' : 'viewer';
     const rawMessage = data?.message;
 
     const banInfo = bannedUsers.get(userId);
@@ -325,7 +470,7 @@ io.on('connection', (socket) => {
     }
 
     const lastSent = rateLimitMap.get(socket.id) || 0;
-    if (Date.now() - lastSent < 400 && !socket.isAdmin) {
+    if (Date.now() - lastSent < 400) {
       return socket.emit('chat:error', { message: 'You are typing too fast. Please slow down.' });
     }
     rateLimitMap.set(socket.id, Date.now());
@@ -341,7 +486,7 @@ io.on('connection', (socket) => {
       stream_id: streamState.id,
       user_id: userId,
       username: username,
-      role: role,
+      role: 'viewer',
       message: cleanMessage,
       created_at: new Date().toISOString(),
       is_deleted: false,
@@ -351,82 +496,23 @@ io.on('connection', (socket) => {
     if (chatMessages.length > 200) chatMessages.shift();
 
     io.to(streamState.id).emit('chat:new-message', newMsg);
+    adminNs.emit('chat:new-message', newMsg);
   });
 
-  socket.on('chat:delete-message', (data) => {
-    if (!socket.isAdmin) {
-      return socket.emit('admin:error', { message: 'Unauthorized. Admin authorization required.' });
-    }
-    const messageId = data?.messageId;
-    if (!messageId) return;
-
-    const target = chatMessages.find((m) => m.id === messageId);
-    if (target) {
-      target.is_deleted = true;
-      target.message = 'This message was removed by a moderator.';
-    }
-
-    io.to(streamState.id).emit('chat:message-deleted', { messageId });
-  });
-
-  socket.on('chat:timeout-user', (data) => {
-    if (!socket.isAdmin) {
-      return socket.emit('admin:error', { message: 'Unauthorized. Admin authorization required.' });
-    }
-    const { userId, username, durationSeconds = 60, reason } = data || {};
-    if (!userId) return;
-
-    const timeoutUntil = Date.now() + durationSeconds * 1000;
-    bannedUsers.set(userId, { reason, timeoutUntil });
-
-    io.to(streamState.id).emit('chat:system-notice', {
-      notice: `User @${username || userId} has been timed out for ${durationSeconds}s.`,
-    });
-  });
-
-  socket.on('chat:ban-user', (data) => {
-    if (!socket.isAdmin) {
-      return socket.emit('admin:error', { message: 'Unauthorized. Admin authorization required.' });
-    }
-    const { userId, username, reason } = data || {};
-    if (!userId) return;
-
-    bannedUsers.set(userId, { reason: reason || 'Banned by admin', timeoutUntil: null });
-
-    io.to(streamState.id).emit('chat:system-notice', {
-      notice: `User @${username || userId} has been banned from chat.`,
-    });
-  });
-
-  socket.on('chat:clear-chat', () => {
-    if (!socket.isAdmin) {
-      return socket.emit('admin:error', { message: 'Unauthorized. Admin authorization required.' });
-    }
-    chatMessages.length = 0;
-    io.to(streamState.id).emit('chat:cleared');
-  });
-
+  // Disconnect
   socket.on('disconnect', () => {
     rateLimitMap.delete(socket.id);
-
-    if (socket.id === streamState.streamerSocketId) {
-      streamState.status = 'offline';
-      streamState.streamerSocketId = null;
-      streamState.ended_at = new Date().toISOString();
-      io.to(streamState.id).emit('stream:status-changed', { status: 'offline' });
-      io.to(streamState.id).emit('stream:stopped');
-    }
 
     if (socket.data?.viewerId) {
       const streamViewers = viewersPresence.get(socket.data.streamId || streamState.id);
       if (streamViewers) {
         streamViewers.delete(socket.data.viewerId);
-        updateViewerStats(io, socket.data.streamId || streamState.id);
+        broadcastViewerStats(io, adminNs, socket.data.streamId || streamState.id);
       }
     }
   });
 });
 
 server.listen(port, () => {
-  console.log(`> StreamPulse Signaling & Realtime Server active on port ${port}`);
+  console.log(`> StreamPulse Signaling & Realtime Server running on port ${port}`);
 });
