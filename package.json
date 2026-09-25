@@ -1,0 +1,14 @@
+{
+  "name": "streampulse-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "StreamPulse Standalone WebRTC Signaling, Presence & Chat Server",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "socket.io": "^4.8.1"
+  }
+}
